@@ -1,4 +1,7 @@
+desc "Check Erlang's version, build Reia and then test it"
 task :default => [:check_erl_version, :build, :test]
+
+desc "Build the executables"
 task :build => [:smerl, :leex, :yecc, :reia, :ebin, :clean]
 
 def erlang_version
@@ -11,6 +14,7 @@ def erlang_version
   version[0]
 end
 
+desc "Check if the installed version of Erlang meets the requirements"
 task :check_erl_version do
   print "Checking Erlang version... "
   version = erlang_version
@@ -97,10 +101,12 @@ task :ebin do
   FileList["artifacts/beam/*.beam"].each { |file| cp file, "ebin" }
 end
 
+desc "Run Reia tests"
 task :test do
   sh "bin/reia test/runner.re"
 end
 
+desc "Install Reia"
 task :install do
   lib_dir = `erl -noshell -eval "io:format(code:lib_dir())" -s init stop`
   reia_dir = File.join(lib_dir, 'reia', '')
