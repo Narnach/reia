@@ -12,7 +12,9 @@
 %% Convert a Reia class definition into a Reia module which conforms to the
 %% gen_server behavior, then load it into the code server
 build({class, Line, Name, Functions}) ->
-  Module = {module, Line, Name, process_functions(Name, Functions)},
+  Functions2 = process_functions(Name, Functions),
+  % [io:format(erl_pp:form(Function)) || Function <- Functions2],
+  Module = {module, Line, Name, Functions2},
   % io:format("~p~n", [Module]),
   reia_module:build(Module);
 build(_) ->
@@ -73,7 +75,7 @@ initialize_clause({clause, Line, Arguments, Guards, Expressions}) ->
   
 %% Convert individual method definitions into a single dispatch_method function
 process_methods([]) ->
-  [];
+  build_method_dispatch_function(1, lists:flatten([process_method(Method) || Method <- default_methods()]));
 process_methods([FirstMeth|_] = Methods) ->
   % Extract the line number from the first method
   {function, Line, _, _, _} = FirstMeth,
@@ -81,6 +83,10 @@ process_methods([FirstMeth|_] = Methods) ->
   % Decompose the function clauses for methods into handle_call clauses
   Clauses = lists:flatten([process_method(Method) || Method <- Methods ++ default_methods()]),
   
+  build_method_dispatch_function(Line, Clauses).
+
+%% Generate Erlang forms for the class's method dispatch function
+build_method_dispatch_function(Line, Clauses) ->
   % Add a clause which thunks to method_missing
   MethodMissingThunk = "dispatch_method({Method, Args}, _, State) -> method_missing(State, Method, Args).",
   {function, _, _, _, MethodMissingClause} = parse_function(MethodMissingThunk),
@@ -105,10 +111,10 @@ process_return_value(Line, []) ->
   process_return_value(Line, [{atom, Line, 'nil'}]);
 process_return_value(Line, Expressions) ->
   [Result|Expressions2] = lists:reverse(Expressions),
-  Result2 = {match, Line, {var, Line, '__return_value'}, Result},
+  Result2 = {match, Line, {var, Line, '__method_return_value'}, Result},
   Result3 = {tuple, Line, [
     {atom, Line, reply},
-    {tuple, Line, [{atom, Line, ok}, {var, Line, '__return_value'}]}, 
+    {tuple, Line, [{atom, Line, ok}, {var, Line, '__method_return_value'}]}, 
     {var, Line, final_ivars(Expressions)}
   ]},
   lists:reverse([Result3,Result2|Expressions2]).

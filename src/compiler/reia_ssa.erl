@@ -106,7 +106,7 @@ transform({Mode, Dict}, {match, Line, In1, In2}) ->
 % Case expressions bind variables in clauses
 transform({Mode, Dict}, {'case', Line, Expression, Clauses}) ->
   {ok, {_, Dict2}, Expression2} = reia_visitor:transform(Expression, {Mode, Dict}, fun transform/2),
-  {ok, {_, Dict3}, Clauses2} = reia_visitor:transform(Clauses, {'case', Dict2}, fun transform/2),
+  {Dict3, Clauses2} = process_clauses('case', Dict2, Clauses),
   {stop, {Mode, Dict3}, {'case', Line, Expression2, Clauses2}};
 
 % Case clauses match against patterns
@@ -172,6 +172,107 @@ transform({match, _} = State, {var, Line, Name}) ->
 % Walk unrecognized nodes without transforming them
 transform(State, Node) ->
   {walk, State, Node}.
+  
+% Process clauses, giving each branch its own dict and ensuring the highest
+% numbered versions of each variable are bound at the end of each clause
+process_clauses(Type, Vars, Clauses) ->
+  % Proceed with the normal SSA transformation on each clause
+  Clauses2 = lists:map(fun(Clause) ->
+    {ok, {_, Binding}, Clause2} = reia_visitor:transform(Clause, {Type, Vars}, fun transform/2),
+    {Binding, Clause2}
+  end, Clauses),
+  
+  % Extract a nested list of bound variables and SSA versions for each clause
+  ClauseVars = [Binding || {Binding, _} <- Clauses2],
+  
+  % Build a dict of the highest version numbers of any variables referenced 
+  % in any clause
+  NewestVars = lists:foldl(fun update_binding/2, dict:new(), ClauseVars),
+    
+  % Bind any "unsafe" variables in the clauses to the latest SSA version
+  Clauses3 = [bind_unsafe_variables({Vars, Binding, NewestVars}, Clause) || {Binding, Clause} <- Clauses2],
+  
+  % Determine the final SSA versions of all variables known for the current binding
+  FinalVars = update_binding(Vars, NewestVars),
+  
+  {FinalVars, Clauses3}.
+
+% Update the OldBinding dictionary with the newest version numbers from 
+% NewBinding, producing a new dictionary
+update_binding(OldBinding, NewBinding) ->
+  lists:foldl(fun({Var, Version}, NewestVars) ->
+    case dict:find(Var, NewestVars) of
+      {ok, NewestVersion} ->
+        if Version > NewestVersion ->
+          dict:store(Var, Version, NewestVars);
+        true ->
+          NewestVars
+        end;
+      error ->
+        dict:store(Var, Version, NewestVars)
+    end    
+  end, OldBinding, dict:to_list(NewBinding)).
+  
+% The versions variables are left in after the SSA transform runs are not 
+% necessarily the latest ones used among the entire set of clauses.  Worse, 
+% some clauses may have bound new variables.  These variables are "unsafe"
+% if any are referenced after the statement the clauses belong to.  To avoid
+% this, we need to ensure that all clauses bind the same set of variables upon
+% completion, while still preserving the original return value.
+bind_unsafe_variables(Variables, {clause, Line, Pattern, Expressions}) ->
+  {DestVersions, SourceVersions} = enumerate_unsafe_variables(Variables),
+  
+  % Build the match expression to bind potentially unsafe variables
+  DestTuple   = {tuple, Line, [build_form_for_variable(Var, Line) || Var <- DestVersions]},
+  SourceTuple = {tuple, Line, [build_form_for_variable(Var, Line) || Var <- SourceVersions]},
+  MatchExpr = {match, Line, DestTuple, SourceTuple},
+  
+  {clause, Line, Pattern, process_return_value(Line, Expressions, MatchExpr)}.
+
+% Build a list of potentially unsafe variables that need to be bound along with
+% their source and destination versions  
+enumerate_unsafe_variables({OrigVars, ClauseVars, FinalVars}) ->
+  lists:foldl(fun({Var, FinalVersion}, {DestVersions, SourceVersions}) ->
+    case dict:find(Var, ClauseVars) of
+      {ok, ClauseVersion} ->
+        if ClauseVersion < FinalVersion ->
+          {[{Var, FinalVersion}|DestVersions], [{Var, ClauseVersion}|SourceVersions]};
+        true ->
+          {DestVersions, SourceVersions}
+        end;
+      error ->
+        case dict:find(Var, OrigVars) of
+          {ok, OrigVersion} ->
+            {[{Var, FinalVersion}|DestVersions], [{Var, OrigVersion}|SourceVersions]};
+          error ->
+            case internal_variable(Var) of
+              true -> Version = 0;
+              false -> Version = nil
+            end,
+            {[{Var, FinalVersion}|DestVersions], [{Var, Version}|SourceVersions]}
+        end
+      end
+  end, {[], []}, dict:to_list(FinalVars)).
+
+% Convert a tuple returned from enumerate_unsafe_variables into the appropriate
+% Erlang abstract form
+build_form_for_variable({_, nil}, Line) ->
+  {atom, Line, nil};
+build_form_for_variable({Name, Version}, Line) ->
+  {identifier, Line, ssa_name(Name, Version)}.
+  
+%% Convert a method's return value into a gen_server reply
+process_return_value(Line, [], MatchExpr) ->
+  [MatchExpr, {atom, Line, 'nil'}];
+process_return_value(Line, Expressions, MatchExpr) ->
+  [Result|Expressions2] = lists:reverse(Expressions),
+  ReturnVar = {identifier, Line, list_to_atom("__clause_return_value_" ++ nonce_name())},
+  Result2 = {match, Line, ReturnVar, Result},
+  lists:reverse([ReturnVar, MatchExpr, Result2|Expressions2]).
+  
+% Generate a single-use variable name
+nonce_name() ->
+  lists:flatten([io_lib:format("~.16b",[N]) || <<N>> <= erlang:md5(term_to_binary(make_ref()))]).  
   
 % Generate the SSA name for a given variable, which takes the form name_version
 ssa_name(Name, Version) ->
